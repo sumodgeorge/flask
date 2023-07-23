@@ -1,13 +1,11 @@
 # This file was part of Flask-CLI and was modified under the terms of
 # its Revised BSD License. Copyright © 2015 CERN.
 import os
-import platform
 import ssl
 import sys
 import types
 from functools import partial
 from pathlib import Path
-from unittest.mock import patch
 
 import click
 import pytest
@@ -18,14 +16,11 @@ from flask import Blueprint
 from flask import current_app
 from flask import Flask
 from flask.cli import AppGroup
-from flask.cli import DispatchingApp
-from flask.cli import dotenv
 from flask.cli import find_best_app
 from flask.cli import FlaskGroup
 from flask.cli import get_version
 from flask.cli import load_dotenv
 from flask.cli import locate_app
-from flask.cli import main as cli_main
 from flask.cli import NoAppException
 from flask.cli import prepare_import
 from flask.cli import run_command
@@ -293,24 +288,22 @@ def test_scriptinfo(test_apps, monkeypatch):
     assert app.name == "testapp"
 
 
-@pytest.mark.xfail(platform.python_implementation() == "PyPy", reason="flaky on pypy")
-def test_lazy_load_error(monkeypatch):
-    """When using lazy loading, the correct exception should be
-    re-raised.
-    """
+def test_app_cli_has_app_context(app, runner):
+    def _param_cb(ctx, param, value):
+        # current_app should be available in parameter callbacks
+        return bool(current_app)
 
-    class BadExc(Exception):
-        pass
+    @app.cli.command()
+    @click.argument("value", callback=_param_cb)
+    def check(value):
+        app = click.get_current_context().obj.load_app()
+        # the loaded app should be the same as current_app
+        same_app = current_app._get_current_object() is app
+        return same_app, value
 
-    def bad_load():
-        raise BadExc
-
-    lazy = DispatchingApp(bad_load, use_eager_loading=False)
-
-    with pytest.raises(BadExc):
-        # reduce flakiness by waiting for the internal loading lock
-        with lazy._lock:
-            lazy._flush_bg_loading_exception()
+    cli = FlaskGroup(create_app=lambda: app)
+    result = runner.invoke(cli, ["check", "x"], standalone_mode=False)
+    assert result.return_value == (True, True)
 
 
 def test_with_appcontext(runner):
@@ -326,12 +319,12 @@ def test_with_appcontext(runner):
     assert result.output == "testapp\n"
 
 
-def test_appgroup(runner):
+def test_appgroup_app_context(runner):
     @click.group(cls=AppGroup)
     def cli():
         pass
 
-    @cli.command(with_appcontext=True)
+    @cli.command()
     def test():
         click.echo(current_app.name)
 
@@ -339,7 +332,7 @@ def test_appgroup(runner):
     def subgroup():
         pass
 
-    @subgroup.command(with_appcontext=True)
+    @subgroup.command()
     def test2():
         click.echo(current_app.name)
 
@@ -354,7 +347,7 @@ def test_appgroup(runner):
     assert result.output == "testappgroup\n"
 
 
-def test_flaskgroup(runner):
+def test_flaskgroup_app_context(runner):
     def create_app():
         return Flask("flaskgroup")
 
@@ -391,6 +384,19 @@ def test_flaskgroup_debug(runner, set_debug_flag):
     assert result.output == f"{not set_debug_flag}\n"
 
 
+def test_flaskgroup_nested(app, runner):
+    cli = click.Group("cli")
+    flask_group = FlaskGroup(name="flask", create_app=lambda: app)
+    cli.add_command(flask_group)
+
+    @flask_group.command()
+    def show():
+        click.echo(current_app.name)
+
+    result = runner.invoke(cli, ["flask", "show"])
+    assert result.output == "flask_test\n"
+
+
 def test_no_command_echo_loading_error():
     from flask.cli import cli
 
@@ -425,33 +431,19 @@ def test_help_echo_exception():
 
 class TestRoutes:
     @pytest.fixture
-    def invoke(self, runner):
-        def create_app():
-            app = Flask(__name__)
-            app.testing = True
-
-            @app.route("/get_post/<int:x>/<int:y>", methods=["GET", "POST"])
-            def yyy_get_post(x, y):
-                pass
-
-            @app.route("/zzz_post", methods=["POST"])
-            def aaa_post():
-                pass
-
-            return app
-
-        cli = FlaskGroup(create_app=create_app)
-        return partial(runner.invoke, cli)
+    def app(self):
+        app = Flask(__name__)
+        app.add_url_rule(
+            "/get_post/<int:x>/<int:y>",
+            methods=["GET", "POST"],
+            endpoint="yyy_get_post",
+        )
+        app.add_url_rule("/zzz_post", methods=["POST"], endpoint="aaa_post")
+        return app
 
     @pytest.fixture
-    def invoke_no_routes(self, runner):
-        def create_app():
-            app = Flask(__name__, static_folder=None)
-            app.testing = True
-
-            return app
-
-        cli = FlaskGroup(create_app=create_app)
+    def invoke(self, app, runner):
+        cli = FlaskGroup(create_app=lambda: app)
         return partial(runner.invoke, cli)
 
     def expect_order(self, order, output):
@@ -465,7 +457,7 @@ class TestRoutes:
         assert result.exit_code == 0
         self.expect_order(["aaa_post", "static", "yyy_get_post"], result.output)
 
-    def test_sort(self, invoke):
+    def test_sort(self, app, invoke):
         default_output = invoke(["routes"]).output
         endpoint_output = invoke(["routes", "-s", "endpoint"]).output
         assert default_output == endpoint_output
@@ -477,10 +469,8 @@ class TestRoutes:
             ["yyy_get_post", "static", "aaa_post"],
             invoke(["routes", "-s", "rule"]).output,
         )
-        self.expect_order(
-            ["aaa_post", "yyy_get_post", "static"],
-            invoke(["routes", "-s", "match"]).output,
-        )
+        match_order = [r.endpoint for r in app.url_map.iter_rules()]
+        self.expect_order(match_order, invoke(["routes", "-s", "match"]).output)
 
     def test_all_methods(self, invoke):
         output = invoke(["routes"]).output
@@ -488,13 +478,44 @@ class TestRoutes:
         output = invoke(["routes", "--all-methods"]).output
         assert "GET, HEAD, OPTIONS, POST" in output
 
-    def test_no_routes(self, invoke_no_routes):
-        result = invoke_no_routes(["routes"])
+    def test_no_routes(self, runner):
+        app = Flask(__name__, static_folder=None)
+        cli = FlaskGroup(create_app=lambda: app)
+        result = runner.invoke(cli, ["routes"])
         assert result.exit_code == 0
         assert "No routes were registered." in result.output
 
+    def test_subdomain(self, runner):
+        app = Flask(__name__, static_folder=None)
+        app.add_url_rule("/a", subdomain="a", endpoint="a")
+        app.add_url_rule("/b", subdomain="b", endpoint="b")
+        cli = FlaskGroup(create_app=lambda: app)
+        result = runner.invoke(cli, ["routes"])
+        assert result.exit_code == 0
+        assert "Subdomain" in result.output
 
-need_dotenv = pytest.mark.skipif(dotenv is None, reason="dotenv is not installed")
+    def test_host(self, runner):
+        app = Flask(__name__, static_folder=None, host_matching=True)
+        app.add_url_rule("/a", host="a", endpoint="a")
+        app.add_url_rule("/b", host="b", endpoint="b")
+        cli = FlaskGroup(create_app=lambda: app)
+        result = runner.invoke(cli, ["routes"])
+        assert result.exit_code == 0
+        assert "Host" in result.output
+
+
+def dotenv_not_available():
+    try:
+        import dotenv  # noqa: F401
+    except ImportError:
+        return True
+
+    return False
+
+
+need_dotenv = pytest.mark.skipif(
+    dotenv_not_available(), reason="dotenv is not installed"
+)
 
 
 @need_dotenv
@@ -532,7 +553,7 @@ def test_dotenv_path(monkeypatch):
 
 
 def test_dotenv_optional(monkeypatch):
-    monkeypatch.setattr("flask.cli.dotenv", None)
+    monkeypatch.setitem(sys.modules, "dotenv", None)
     monkeypatch.chdir(test_path)
     load_dotenv()
     assert "FOO" not in os.environ
@@ -555,7 +576,12 @@ def test_run_cert_path():
     with pytest.raises(click.BadParameter):
         run_command.make_context("run", ["--key", __file__])
 
+    # cert specified first
     ctx = run_command.make_context("run", ["--cert", __file__, "--key", __file__])
+    assert ctx.params["cert"] == (__file__, __file__)
+
+    # key specified first
+    ctx = run_command.make_context("run", ["--key", __file__, "--cert", __file__])
     assert ctx.params["cert"] == (__file__, __file__)
 
 
@@ -599,7 +625,8 @@ def test_run_cert_import(monkeypatch):
 
 
 def test_run_cert_no_ssl(monkeypatch):
-    monkeypatch.setattr("flask.cli.ssl", None)
+    monkeypatch.setitem(sys.modules, "ssl", None)
+
     with pytest.raises(click.BadParameter):
         run_command.make_context("run", ["--cert", "not_here"])
 
@@ -654,11 +681,3 @@ def test_cli_empty(app):
 
     result = app.test_cli_runner().invoke(args=["blue", "--help"])
     assert result.exit_code == 2, f"Unexpected success:\n\n{result.output}"
-
-
-def test_click_7_deprecated():
-    with patch("flask.cli.cli"):
-        if int(click.__version__[0]) < 8:
-            pytest.deprecated_call(cli_main, match=".* Click 7 is deprecated")
-        else:
-            cli_main()
