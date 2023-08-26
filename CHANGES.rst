@@ -1,10 +1,20 @@
+Version 3.0.0
+-------------
+
+Unreleased
+
+-   Remove previously deprecated code. :pr:`5223`
+-   Restructure the code such that the Flask (app) and Blueprint
+    classes have Sans-IO bases. :pr:`5127`
+
+
 Version 2.3.3
 -------------
 
 Unreleased
 
 -   Python 3.12 compatibility.
--   Require Werkzeug >= 2.3.6.
+-   Require Werkzeug >= 2.3.7.
 -   Use ``flit_core`` instead of ``setuptools`` as build backend.
 -   Refactor how an app's root and instance paths are determined. :issue:`5160`
 
